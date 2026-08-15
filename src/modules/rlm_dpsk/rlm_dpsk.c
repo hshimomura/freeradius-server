@@ -33,6 +33,7 @@ RCSID("$Id$")
 #include <openssl/ssl.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/cmac.h>
 
 #include <ctype.h>
 
@@ -50,6 +51,18 @@ RCSID("$Id$")
 #define PW_RUCKUS_DPSK_EAPOL_KEY_FRAME	(PW_RUCKUS_DPSK_PARAMS | (4 << 8))
 
 #define VLAN_ID_MAX	(4094)
+
+#define EAPOL_KEY_FIXED_LEN		(99)
+#define EAPOL_KEY_MAX_LEN		(4096)
+#define EAPOL_KEY_INFO_VERSION_MASK	(0x0007)
+#define EAPOL_KEY_INFO_VERSION_HMAC_SHA1	(2)
+#define EAPOL_KEY_INFO_VERSION_AES_CMAC	(3)
+
+#define WLAN_EID_RSN			(48)
+#define WLAN_EID_MOBILITY_DOMAIN	(54)
+#define WLAN_EID_FAST_BSS_TRANSITION	(55)
+#define FT_R0KH_ID_MAX_LEN		(48)
+#define FT_R1KH_ID_LEN			(6)
 
 /*
   Header:		02030075
@@ -89,6 +102,13 @@ typedef struct eapol_attr_t {
 	uint8_t		header[4];		// 02030075
 	eapol_key_frame_t frame;
 } CC_HINT(__packed__) eapol_attr_t;
+
+typedef struct dpsk_ft_info_t {
+	uint8_t		mdid[2];
+	uint8_t		r0kh_id[FT_R0KH_ID_MAX_LEN];
+	size_t		r0kh_id_len;
+	uint8_t		r1kh_id[FT_R1KH_ID_LEN];
+} dpsk_ft_info_t;
 
 #ifdef HAVE_PTHREAD_H
 #define PTHREAD_MUTEX_LOCK pthread_mutex_lock
@@ -177,6 +197,283 @@ static void rdebug_hex(REQUEST *request, char const *prefix, uint8_t const *data
 	RDEBUG("%s %s", prefix, buffer);
 }
 #define RDEBUG_HEX if (rad_debug_lvl >= 3) rdebug_hex
+
+static uint16_t dpsk_get_be16(uint8_t const *p)
+{
+	return ((uint16_t) p[0] << 8) | p[1];
+}
+
+static uint16_t dpsk_get_le16(uint8_t const *p)
+{
+	return ((uint16_t) p[1] << 8) | p[0];
+}
+
+static void dpsk_put_le16(uint8_t p[2], uint16_t value)
+{
+	p[0] = value & 0xff;
+	p[1] = value >> 8;
+}
+
+/*
+ *	Check whether an RSN IE selects the FT-PSK AKM suite (00-0f-ac:4).
+ */
+static int dpsk_rsn_is_ft_psk(uint8_t const *data, size_t data_len)
+{
+	uint8_t const *p = data;
+	size_t left = data_len;
+	uint16_t count;
+	bool found = false;
+
+	if (left < 8) return -1;
+	if (dpsk_get_le16(p) != 1) return -1;
+	p += 2;
+	left -= 2;
+
+	/* Group cipher suite. */
+	p += 4;
+	left -= 4;
+
+	if (left < 2) return -1;
+	count = dpsk_get_le16(p);
+	p += 2;
+	left -= 2;
+	if (!count || (count > (left / 4))) return -1;
+	p += count * 4;
+	left -= count * 4;
+
+	if (left < 2) return -1;
+	count = dpsk_get_le16(p);
+	p += 2;
+	left -= 2;
+	if (!count || (count > (left / 4))) return -1;
+
+	while (count--) {
+		if ((p[0] == 0x00) && (p[1] == 0x0f) && (p[2] == 0xac) && (p[3] == 0x04)) found = true;
+		p += 4;
+	}
+
+	return found ? 1 : 0;
+}
+
+/*
+ *	Parse the FT parameters carried in message 2 of the four-way handshake.
+ */
+static int dpsk_parse_ft(REQUEST *request, dpsk_ft_info_t *out,
+			 uint8_t const *key_data, size_t key_data_len)
+{
+	uint8_t const *p = key_data;
+	size_t left = key_data_len;
+	bool have_rsn = false, have_mdie = false, have_ftie = false;
+	bool have_r0kh_id = false, have_r1kh_id = false;
+
+	memset(out, 0, sizeof(*out));
+
+	while (left) {
+		uint8_t id, ie_len;
+		uint8_t const *body;
+
+		if (left < 2) {
+			RDEBUG("FT key data ends with an incomplete information element");
+			return -1;
+		}
+
+		id = p[0];
+		ie_len = p[1];
+		p += 2;
+		left -= 2;
+		if (ie_len > left) {
+			RDEBUG("FT information element %u exceeds the EAPoL-Key data", id);
+			return -1;
+		}
+		body = p;
+
+		switch (id) {
+		case WLAN_EID_RSN:
+			{
+				int ret = dpsk_rsn_is_ft_psk(body, ie_len);
+				if (ret < 0) {
+					RDEBUG("FT request contains a malformed RSN IE");
+					return -1;
+				}
+				if (ret > 0) have_rsn = true;
+			}
+			break;
+
+		case WLAN_EID_MOBILITY_DOMAIN:
+			if (ie_len < 3) {
+				RDEBUG("FT request contains a malformed Mobility Domain IE");
+				return -1;
+			}
+			memcpy(out->mdid, body, sizeof(out->mdid));
+			have_mdie = true;
+			break;
+
+		case WLAN_EID_FAST_BSS_TRANSITION:
+			{
+				uint8_t const *sub;
+				size_t sub_left;
+
+				/* MIC control + MIC + ANonce + SNonce. */
+				if (ie_len < 82) {
+					RDEBUG("FT request contains a malformed Fast BSS Transition IE");
+					return -1;
+				}
+				sub = body + 82;
+				sub_left = ie_len - 82;
+				while (sub_left) {
+					uint8_t sub_id, sub_len;
+
+					if (sub_left < 2) return -1;
+					sub_id = sub[0];
+					sub_len = sub[1];
+					sub += 2;
+					sub_left -= 2;
+					if (sub_len > sub_left) return -1;
+
+					if (sub_id == 1) {
+						if (sub_len != FT_R1KH_ID_LEN) return -1;
+						memcpy(out->r1kh_id, sub, FT_R1KH_ID_LEN);
+						have_r1kh_id = true;
+					} else if (sub_id == 3) {
+						if (!sub_len || (sub_len > FT_R0KH_ID_MAX_LEN)) return -1;
+						memcpy(out->r0kh_id, sub, sub_len);
+						out->r0kh_id_len = sub_len;
+						have_r0kh_id = true;
+					}
+
+					sub += sub_len;
+					sub_left -= sub_len;
+				}
+				have_ftie = true;
+			}
+			break;
+		}
+
+		p += ie_len;
+		left -= ie_len;
+	}
+
+	if (!(have_rsn && have_mdie && have_ftie && have_r0kh_id && have_r1kh_id)) {
+		RDEBUG("Descriptor version 3 request is missing FT-PSK, MDIE, FTIE, R0KH-ID, or R1KH-ID data");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ *	IEEE 802.11 SHA-256 KDF.  The counter and output bit length are
+ *	little-endian 16-bit values, matching hostap's sha256_prf_bits().
+ */
+static int dpsk_sha256_prf(uint8_t const *key, size_t key_len, char const *label,
+			   uint8_t const *data, size_t data_len,
+			   uint8_t *out, size_t out_len)
+{
+	uint8_t input[256], digest[EVP_MAX_MD_SIZE];
+	size_t label_len = strlen(label), pos = 0;
+	uint16_t counter = 1;
+	unsigned int digest_len;
+
+	if (!out_len || (out_len > (UINT16_MAX / 8))) return -1;
+	if ((2 + label_len + data_len + 2) > sizeof(input)) return -1;
+
+	memcpy(input + 2, label, label_len);
+	memcpy(input + 2 + label_len, data, data_len);
+	dpsk_put_le16(input + 2 + label_len + data_len, (uint16_t) (out_len * 8));
+
+	while (pos < out_len) {
+		size_t copy_len;
+
+		dpsk_put_le16(input, counter++);
+		digest_len = sizeof(digest);
+		if (!HMAC(EVP_sha256(), key, key_len, input, 2 + label_len + data_len + 2,
+			  digest, &digest_len) || (digest_len != 32)) {
+			OPENSSL_cleanse(digest, sizeof(digest));
+			return -1;
+		}
+
+		copy_len = out_len - pos;
+		if (copy_len > digest_len) copy_len = digest_len;
+		memcpy(out + pos, digest, copy_len);
+		pos += copy_len;
+	}
+
+	OPENSSL_cleanse(digest, sizeof(digest));
+	OPENSSL_cleanse(input, sizeof(input));
+	return 0;
+}
+
+static int dpsk_ft_kck(uint8_t kck[16], uint8_t const pmk[32], VALUE_PAIR const *ssid,
+		       dpsk_ft_info_t const *ft, uint8_t const sta[6], uint8_t const bssid[6],
+		       uint8_t const snonce[32], uint8_t const anonce[32])
+{
+	uint8_t data[1 + 32 + 2 + 1 + FT_R0KH_ID_MAX_LEN + 6];
+	uint8_t pmk_r0_key_data[48], pmk_r0[32], pmk_r1[32], ptk[48];
+	uint8_t *p;
+	int ret = -1;
+
+	if (!ssid->vp_length || (ssid->vp_length > 32)) return -1;
+
+	p = data;
+	*p++ = ssid->vp_length;
+	memcpy(p, ssid->vp_octets, ssid->vp_length);
+	p += ssid->vp_length;
+	memcpy(p, ft->mdid, sizeof(ft->mdid));
+	p += sizeof(ft->mdid);
+	*p++ = ft->r0kh_id_len;
+	memcpy(p, ft->r0kh_id, ft->r0kh_id_len);
+	p += ft->r0kh_id_len;
+	memcpy(p, sta, 6);
+	p += 6;
+
+	if (dpsk_sha256_prf(pmk, 32, "FT-R0", data, p - data,
+			    pmk_r0_key_data, sizeof(pmk_r0_key_data)) < 0) goto done;
+	memcpy(pmk_r0, pmk_r0_key_data, sizeof(pmk_r0));
+
+	memcpy(data, ft->r1kh_id, FT_R1KH_ID_LEN);
+	memcpy(data + FT_R1KH_ID_LEN, sta, 6);
+	if (dpsk_sha256_prf(pmk_r0, sizeof(pmk_r0), "FT-R1", data, 12,
+			    pmk_r1, sizeof(pmk_r1)) < 0) goto done;
+
+	memcpy(data, snonce, 32);
+	memcpy(data + 32, anonce, 32);
+	memcpy(data + 64, bssid, 6);
+	memcpy(data + 70, sta, 6);
+	if (dpsk_sha256_prf(pmk_r1, sizeof(pmk_r1), "FT-PTK", data, 76,
+			    ptk, sizeof(ptk)) < 0) goto done;
+
+	memcpy(kck, ptk, 16);
+	ret = 0;
+
+done:
+	OPENSSL_cleanse(data, sizeof(data));
+	OPENSSL_cleanse(pmk_r0_key_data, sizeof(pmk_r0_key_data));
+	OPENSSL_cleanse(pmk_r0, sizeof(pmk_r0));
+	OPENSSL_cleanse(pmk_r1, sizeof(pmk_r1));
+	OPENSSL_cleanse(ptk, sizeof(ptk));
+	return ret;
+}
+
+DIAG_OFF(deprecated-declarations)
+static int dpsk_aes_cmac(uint8_t const key[16], uint8_t const *data, size_t data_len, uint8_t mac[16])
+{
+	CMAC_CTX *ctx;
+	size_t mac_len;
+	int ret = -1;
+
+	ctx = CMAC_CTX_new();
+	if (!ctx) return -1;
+	if (CMAC_Init(ctx, key, 16, EVP_aes_128_cbc(), NULL) != 1) goto done;
+	if (CMAC_Update(ctx, data, data_len) != 1) goto done;
+	if (CMAC_Final(ctx, mac, &mac_len) != 1) goto done;
+	if (mac_len != 16) goto done;
+	ret = 0;
+
+done:
+	CMAC_CTX_free(ctx);
+	return ret;
+}
+DIAG_ON(deprecated-declarations)
 
 #if 0
 /*
@@ -373,10 +670,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	int lineno = 0;
 	int stage = 0;
 	rlm_rcode_t rcode = RLM_MODULE_OK;
-	size_t len, psk_len = 0;
+	size_t len, psk_len = 0, key_data_len;
 	unsigned int digest_len, mic_len;
 	eapol_attr_t const *eapol;
-	eapol_attr_t *zeroed;
 	FILE *fp = NULL;
 	char const *filename = inst->filename;
 	char const *psk_identity = NULL, *psk = NULL;
@@ -385,13 +681,16 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	uint8_t const *min_mac, *max_mac;
 	uint8_t const *min_nonce, *max_nonce;
 	uint8_t pmk[32];
-	uint8_t s_mac[6], message[sizeof("Pairwise key expansion") + 6 + 6 + 32 + 32 + 1], frame[128];
-	uint8_t digest[EVP_MAX_MD_SIZE], mic[EVP_MAX_MD_SIZE];
+	uint8_t s_mac[6], message[sizeof("Pairwise key expansion") + 6 + 6 + 32 + 32 + 1];
+	uint8_t kck[16], mic[EVP_MAX_MD_SIZE], *frame;
 	char token_identity[256];
 	char token_psk[256];
 	char filename_buffer[1024];
 	uint32_t vlan_id = 0;
 	bool have_vlan = false;
+	bool ft_mode = false;
+	uint16_t descriptor_version;
+	dpsk_ft_info_t ft;
 
 	/*
 	 *	Search for the information in a bunch of attributes.
@@ -413,15 +712,35 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 		return RLM_MODULE_NOOP;
 	}
 
-	if (key_msg->vp_length < sizeof(*eapol)) {
-		RDEBUG("%s has incorrect length (%zu < %zu)", inst->frame->name, key_msg->vp_length, sizeof(*eapol));
+	if (key_msg->vp_length < EAPOL_KEY_FIXED_LEN) {
+		RDEBUG("%s has incorrect length (%zu < %u)", inst->frame->name, key_msg->vp_length, EAPOL_KEY_FIXED_LEN);
 		return RLM_MODULE_NOOP;
 	}
 
-	if (key_msg->vp_length > sizeof(frame)) {
-		RDEBUG("%s has incorrect length (%zu > %zu)", inst->frame->name, key_msg->vp_length, sizeof(frame));
+	if (key_msg->vp_length > EAPOL_KEY_MAX_LEN) {
+		RDEBUG("%s has incorrect length (%zu > %u)", inst->frame->name, key_msg->vp_length, EAPOL_KEY_MAX_LEN);
 		return RLM_MODULE_NOOP;
 	}
+
+	if ((key_msg->vp_octets[1] != 3) ||
+	    (((size_t) dpsk_get_be16(key_msg->vp_octets + 2) + 4) != key_msg->vp_length)) {
+		RDEBUG("%s is not a complete EAPoL-Key frame", inst->frame->name);
+		return RLM_MODULE_NOOP;
+	}
+
+	key_data_len = dpsk_get_be16(key_msg->vp_octets + 97);
+	if ((EAPOL_KEY_FIXED_LEN + key_data_len) != key_msg->vp_length) {
+		RDEBUG("%s has inconsistent key data length", inst->frame->name);
+		return RLM_MODULE_NOOP;
+	}
+
+	descriptor_version = dpsk_get_be16(key_msg->vp_octets + 5) & EAPOL_KEY_INFO_VERSION_MASK;
+	if ((descriptor_version != EAPOL_KEY_INFO_VERSION_HMAC_SHA1) &&
+	    (descriptor_version != EAPOL_KEY_INFO_VERSION_AES_CMAC)) {
+		RDEBUG("%s uses unsupported descriptor version %u", inst->frame->name, descriptor_version);
+		return RLM_MODULE_NOOP;
+	}
+	ft_mode = (descriptor_version == EAPOL_KEY_INFO_VERSION_AES_CMAC);
 
 	vp_ssid = fr_pair_find_by_da(request->packet->vps, inst->ssid, TAG_ANY);
 	if (!vp_ssid) {
@@ -494,6 +813,11 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	 *	Then sort the nonces.
 	 */
 	snonce = key_msg->vp_octets + 17;
+	if (ft_mode && (dpsk_parse_ft(request, &ft, key_msg->vp_octets + EAPOL_KEY_FIXED_LEN,
+				      key_data_len) < 0)) {
+		return RLM_MODULE_FAIL;
+	}
+
 	if (memcmp(snonce, anonce->vp_octets, 32) <= 0) {
 		min_nonce = snonce;
 		max_nonce = anonce->vp_octets;
@@ -517,6 +841,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	p += 64;
 	*p = '\0';
 	fr_assert(sizeof(message) == (p + 1 - message));
+
+	MEM(frame = talloc_memdup(request, key_msg->vp_octets, key_msg->vp_length));
+	memset(frame + 81, 0, 16);
 
 	/*
 	 *	If we're caching, then check the cache first, before
@@ -736,35 +1063,49 @@ stage2a:
 		}
 	}
 
-	/*
-	 *	HMAC = HMAC_SHA1(pmk, message);
-	 *
-	 *	We need the first 16 octets of this.
-	 */
 make_digest:
-	digest_len = sizeof(digest);
-	HMAC(EVP_sha1(), pmk, sizeof(pmk), message, sizeof(message), digest, &digest_len);
+	if (ft_mode) {
+		RDEBUG("Using IEEE 802.11r FT-PSK key hierarchy and AES-CMAC");
+		if (dpsk_ft_kck(kck, pmk, vp_ssid, &ft, s_mac, ap_mac,
+				snonce, anonce->vp_octets) < 0) {
+			if (fp) fclose(fp);
+			return RLM_MODULE_FAIL;
+		}
+	} else {
+		/* WPA2-PSK: first 16 octets of HMAC-SHA1(PMK, pairwise expansion). */
+		digest_len = sizeof(mic);
+		if (!HMAC(EVP_sha1(), pmk, sizeof(pmk), message, sizeof(message), mic, &digest_len) ||
+		    (digest_len < sizeof(kck))) {
+			if (fp) fclose(fp);
+			return RLM_MODULE_FAIL;
+		}
+		memcpy(kck, mic, sizeof(kck));
+		RDEBUG_HEX(request, "message:", message, sizeof(message));
+	}
 
-	RDEBUG_HEX(request, "message:", message, sizeof(message));
 	RDEBUG_HEX(request, "pmk   :", pmk, sizeof(pmk));
-	RDEBUG_HEX(request, "kck   :", digest, 16);
-
-	/*
-	 *	Create the frame with the middle field zero, and hash it with the KCK digest we calculated from the key expansion.
-	 */
-	memcpy(frame, key_msg->vp_octets, key_msg->vp_length);
-	zeroed = (eapol_attr_t *) &frame[0];
-	memset(&zeroed->frame.mic[0], 0, 16);
+	RDEBUG_HEX(request, "kck   :", kck, sizeof(kck));
 
 	RDEBUG_HEX(request, "zeroed:", frame, key_msg->vp_length);
 
-	mic_len = sizeof(mic);
-	HMAC(EVP_sha1(), digest, 16, frame, key_msg->vp_length, mic, &mic_len);
+	if (ft_mode) {
+		if (dpsk_aes_cmac(kck, frame, key_msg->vp_length, mic) < 0) {
+			if (fp) fclose(fp);
+			return RLM_MODULE_FAIL;
+		}
+	} else {
+		mic_len = sizeof(mic);
+		if (!HMAC(EVP_sha1(), kck, sizeof(kck), frame, key_msg->vp_length, mic, &mic_len) ||
+		    (mic_len < 16)) {
+			if (fp) fclose(fp);
+			return RLM_MODULE_FAIL;
+		}
+	}
 
 	/*
 	 *	The MICs don't match.
 	 */
-	if (memcmp(&eapol->frame.mic[0], mic, 16) != 0) {
+	if (CRYPTO_memcmp(&eapol->frame.mic[0], mic, 16) != 0) {
 		RDEBUG3("Stage %d", stage);
 		RDEBUG_HEX(request, "calculated mic:", mic, 16);
 		RDEBUG_HEX(request, "packet mic    :", &eapol->frame.mic[0], 16);

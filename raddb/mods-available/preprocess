@@ -68,11 +68,11 @@ preprocess {
 	# This conversion is implemented entirely in rlm_preprocess and
 	# does not require rlm_perl.
 	#
-	# Only non-FT PSK handshakes are currently supported.  With Cisco
-	# Adaptive FT, non-FT stations may continue to use PSK, but
-	# FT-capable stations select FT-PSK.  The fragmented EAPoL-Key data
-	# and IEEE 802.11r key derivation used by FT-PSK are not supported.
-	# Configure Fast Transition as Disabled for this integration.
+	# Cisco Adaptive FT may split the FT-PSK EAPoL-Key frame across
+	# multiple Cisco-AVPair values.  The fragments are reassembled in
+	# request order before the generic rlm_dpsk attributes are created.
+	# rlm_dpsk then validates FT-PSK using the IEEE 802.11r PMK-R0,
+	# PMK-R1, and FT-PTK key hierarchy with AES-CMAC.
 	# See https://github.com/FreeRADIUS/freeradius-server/issues/5912
 	with_cisco_easy_psk_hack = no
 }
