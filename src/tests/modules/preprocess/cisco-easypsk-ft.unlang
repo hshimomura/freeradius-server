@@ -1,0 +1,37 @@
+#
+#  Verify that rlm_preprocess reassembles both Cisco fragments in request
+#  order and exposes exactly one complete FT-PSK EAPoL-Key frame.
+#
+preprocess
+
+if (!&request:Tmp-String-0 || !&request:Tmp-Octets-0 || !&request:Tmp-Octets-1 || !&request:Tmp-Octets-2) {
+	reject
+}
+
+if (&request:Tmp-String-0 != "EasyPSK") {
+	reject
+}
+
+if (&request:Tmp-Octets-0 != 0x6cab059e2c2a) {
+	reject
+}
+
+if (&request:Tmp-Octets-1 != 0xba68f260c749b30e1fdb0fc57b4b15185d966ba2abece6bd1dd541beabedf4ae) {
+	reject
+}
+
+if (&request:Tmp-Octets-2 != 0x020300ee02010b001000000000000000007e23e11a66db674f8b0f26d445844d586acb50c2202be262a8266063efbd628600000000000000000000000000000000000000000000000000000000000000006a8744dbf221c9eb02e890d1fd0dac82008f30260100000fac040100000fac040100000fac040c0001003224b9d936b2e05da206e5fd1874c5d23603ac34003760000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000106d5875460d70c03048ef74882) {
+	reject
+}
+
+if (&request:Tmp-String-0[1] || &request:Tmp-Octets-0[1] || &request:Tmp-Octets-1[1] || &request:Tmp-Octets-2[1]) {
+	reject
+}
+
+update reply {
+	Filter-Id := "success"
+}
+
+update control {
+	Cleartext-Password := "%{User-Name}"
+}

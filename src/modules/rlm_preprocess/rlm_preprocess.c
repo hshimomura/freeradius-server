@@ -30,6 +30,8 @@ RCSID("$Id$")
 
 #include	<ctype.h>
 
+#define CISCO_EASY_PSK_EAPOL_MAX_LEN	(4096)
+
 typedef struct rlm_preprocess_t {
 	char const	*huntgroup_file;
 	char const	*hints_file;
@@ -178,7 +180,7 @@ typedef struct cisco_easy_psk_info_t {
 	uint8_t		bssid[6];
 	uint8_t const	*anonce;
 	size_t		anonce_len;
-	uint8_t const	*eapol;
+	uint8_t		eapol[CISCO_EASY_PSK_EAPOL_MAX_LEN];
 	size_t		eapol_len;
 	size_t		eapol_fragments;
 	bool		have_ssid;
@@ -285,18 +287,16 @@ static int cisco_easy_psk_extract(cisco_easy_psk_info_t *out, REQUEST *request, 
 
 		prefix_len = sizeof(cisco_8021x_data_prefix) - 1;
 		if ((vp->vp_length > prefix_len) && (memcmp(vp->vp_octets, cisco_8021x_data_prefix, prefix_len) == 0)) {
+			size_t fragment_len = vp->vp_length - prefix_len;
+
 			out->eapol_fragments++;
-			if (out->eapol_fragments > 1) {
-				RDEBUG("Cisco EasyPSK EAPoL-Key data is fragmented; FT-PSK is not supported");
+			if (fragment_len > (sizeof(out->eapol) - out->eapol_len)) {
+				RDEBUG("Cisco EasyPSK EAPoL-Key fragments exceed %u octets", CISCO_EASY_PSK_EAPOL_MAX_LEN);
 				return -1;
 			}
 
-			out->eapol = vp->vp_octets + prefix_len;
-			out->eapol_len = vp->vp_length - prefix_len;
-			if (out->eapol_len < 99) {
-				RDEBUG("Cisco EasyPSK EAPoL-Key frame has incorrect length (%zu < 99)", out->eapol_len);
-				return -1;
-			}
+			memcpy(out->eapol + out->eapol_len, vp->vp_octets + prefix_len, fragment_len);
+			out->eapol_len += fragment_len;
 			out->have_eapol = true;
 			continue;
 		}
@@ -304,6 +304,17 @@ static int cisco_easy_psk_extract(cisco_easy_psk_info_t *out, REQUEST *request, 
 
 	if (!saw_cisco_avpair) return 0;
 	if (!(out->have_ssid && out->have_bssid && out->have_anonce && out->have_eapol)) return 0;
+	if (out->eapol_len < 99) {
+		RDEBUG("Cisco EasyPSK EAPoL-Key frame has incorrect length (%zu < 99)", out->eapol_len);
+		return -1;
+	}
+	if ((((size_t) out->eapol[2] << 8) | out->eapol[3]) + 4 != out->eapol_len) {
+		RDEBUG("Cisco EasyPSK EAPoL-Key fragments do not form a complete frame (%zu octets)", out->eapol_len);
+		return -1;
+	}
+	if (out->eapol_fragments > 1) {
+		RDEBUG("Reassembled Cisco EasyPSK EAPoL-Key frame from %zu fragments", out->eapol_fragments);
+	}
 
 	return 1;
 }
@@ -922,4 +933,3 @@ module_t rlm_preprocess = {
 		[MOD_PREACCT]		= mod_preaccounting
 	},
 };
-
